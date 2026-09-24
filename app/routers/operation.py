@@ -1,7 +1,7 @@
-from typing import List, Optional
+from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import or_, and_
 
 from app.database import get_db
 from app.models import OperationData, RobotModel, Scene, Skill, Annotation
@@ -10,28 +10,24 @@ from app.schemas.operation import (
     OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
     AnnotationCreate, AnnotationUpdate, AnnotationResponse
 )
+from app.services.cursor import CursorError, decode_cursor, encode_cursor, to_utc_naive
 
 router = APIRouter()
 
 
-@router.get("/operations", response_model=OperationDataListResponse, tags=["作业数据"])
-def list_operation_data(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
-    robot_model_id: Optional[int] = Query(None, description="机型ID过滤"),
-    scene_id: Optional[int] = Query(None, description="场景ID过滤"),
-    skill_id: Optional[int] = Query(None, description="技能ID过滤"),
-    robot_serial: Optional[str] = Query(None, description="机器人序列号过滤"),
-    data_grade: Optional[str] = Query(None, description="数据等级过滤"),
-    is_annotated: Optional[bool] = Query(None, description="是否已标注"),
-    is_success: Optional[bool] = Query(None, description="标注成功/失败"),
-    failure_category: Optional[str] = Query(None, description="失败大类过滤"),
-    db: Session = Depends(get_db)
+def _apply_operation_filters(
+    query,
+    *,
+    robot_model_id: Optional[int],
+    scene_id: Optional[int],
+    skill_id: Optional[int],
+    robot_serial: Optional[str],
+    data_grade: Optional[str],
+    is_annotated: Optional[bool],
+    is_success: Optional[bool],
+    failure_category: Optional[str],
 ):
-    skip = (page - 1) * page_size
-
-    query = db.query(OperationData)
-
+    """把全部筛选条件叠加到查询上，并返回条件的规范化快照（用于绑定游标）。"""
     if robot_model_id:
         query = query.filter(OperationData.robot_model_id == robot_model_id)
     if scene_id:
@@ -54,14 +50,149 @@ def list_operation_data(
         if failure_category:
             query = query.filter(Annotation.failure_category == failure_category)
 
+    return query
+
+
+def _filter_signature(
+    *,
+    robot_model_id: Optional[int],
+    scene_id: Optional[int],
+    skill_id: Optional[int],
+    robot_serial: Optional[str],
+    data_grade: Optional[str],
+    is_annotated: Optional[bool],
+    is_success: Optional[bool],
+    failure_category: Optional[str],
+) -> dict[str, Any]:
+    """筛选条件的可比较快照；值与发起查询时保持一致即可续用游标。"""
+    return {
+        "robot_model_id": robot_model_id or None,
+        "scene_id": scene_id or None,
+        "skill_id": skill_id or None,
+        "robot_serial": robot_serial or None,
+        "data_grade": data_grade or None,
+        "is_annotated": is_annotated,
+        "is_success": is_success,
+        "failure_category": failure_category or None,
+    }
+
+
+@router.get("/operations", response_model=OperationDataListResponse, tags=["作业数据"])
+def list_operation_data(
+    page: Optional[int] = Query(None, ge=1, description="页码（旧页码分页，默认1）；与 cursor 二选一"),
+    page_size: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = Query(None, description="上一页响应返回的 next_cursor，用于稳定游标分页"),
+    order: str = Query("desc", pattern="^(asc|desc)$", description="按业务开始时间排序：desc 从新到旧，asc 从旧到新"),
+    robot_model_id: Optional[int] = Query(None, description="机型ID过滤"),
+    scene_id: Optional[int] = Query(None, description="场景ID过滤"),
+    skill_id: Optional[int] = Query(None, description="技能ID过滤"),
+    robot_serial: Optional[str] = Query(None, description="机器人序列号过滤"),
+    data_grade: Optional[str] = Query(None, description="数据等级过滤"),
+    is_annotated: Optional[bool] = Query(None, description="是否已标注"),
+    is_success: Optional[bool] = Query(None, description="标注成功/失败"),
+    failure_category: Optional[str] = Query(None, description="失败大类过滤"),
+    db: Session = Depends(get_db)
+):
+    """作业数据查询。
+
+    - 旧页码分页：传 ``page``（默认第1页），行为与历史接口一致；
+    - 稳定游标分页：不传 ``page``，首页传空 ``cursor``，之后把上一页的
+      ``next_cursor`` 原样回传即可；游标绑定当前筛选条件与排序方向，
+      新增/删除数据不会导致重复或漏读，游标可持久化以恢复任务。
+    """
+    filter_kwargs = dict(
+        robot_model_id=robot_model_id,
+        scene_id=scene_id,
+        skill_id=skill_id,
+        robot_serial=robot_serial,
+        data_grade=data_grade,
+        is_annotated=is_annotated,
+        is_success=is_success,
+        failure_category=failure_category,
+    )
+
+    query = db.query(OperationData)
+    query = _apply_operation_filters(query, **filter_kwargs)
     total = query.count()
+
+    timestamp_col = OperationData.timestamp_start
+    id_col = OperationData.id
+
+    # 游标模式：page 缺省即启用，兼容只传 page_size 的历史调用之外的续读场景。
+    cursor_mode = page is None
+    if cursor_mode:
+        filters = _filter_signature(**filter_kwargs)
+        anchor_at = None
+        anchor_id = None
+        if cursor:
+            try:
+                anchor_at, anchor_id = decode_cursor(
+                    cursor, filters=filters, order=order
+                )
+            except CursorError as exc:
+                # 条件被修改、方向不一致或游标损坏：返回明确错误而非静默重读。
+                raise HTTPException(status_code=400, detail=f"无效的分页游标：{exc}")
+
+        order_clauses = (
+            [timestamp_col.asc(), id_col.asc()]
+            if order == "asc"
+            else [timestamp_col.desc(), id_col.desc()]
+        )
+        query = query.order_by(*order_clauses)
+
+        if anchor_at is not None:
+            # 键集条件：(timestamp_start, id) 严格位于锚点之后（含同秒并列的 tie-break）。
+            anchor_naive = to_utc_naive(anchor_at)
+            if order == "asc":
+                query = query.filter(or_(
+                    timestamp_col > anchor_naive,
+                    and_(timestamp_col == anchor_naive, id_col > anchor_id),
+                ))
+            else:
+                query = query.filter(or_(
+                    timestamp_col < anchor_naive,
+                    and_(timestamp_col == anchor_naive, id_col < anchor_id),
+                ))
+
+        # 多取一条判断是否还有下一页，避免依赖可能漂移的 total。
+        rows = query.limit(page_size + 1).all()
+        has_next = len(rows) > page_size
+        items = rows[:page_size]
+
+        next_cursor = None
+        if has_next and items:
+            last = items[-1]
+            next_cursor = encode_cursor(
+                started_at=last.timestamp_start,
+                operation_id=last.id,
+                order=order,
+                filters=filters,
+            )
+
+        return OperationDataListResponse(
+            total=total,
+            items=items,
+            page=None,
+            page_size=page_size,
+            mode="cursor",
+            order=order,
+            has_next=has_next,
+            next_cursor=next_cursor,
+        )
+
+    # 旧页码分页：保持历史行为（offset 分页、按创建时间倒序）。
+    skip = (page - 1) * page_size
     items = query.order_by(OperationData.created_at.desc()).offset(skip).limit(page_size).all()
 
     return OperationDataListResponse(
         total=total,
         items=items,
         page=page,
-        page_size=page_size
+        page_size=page_size,
+        mode="offset",
+        order="desc",
+        has_next=skip + len(items) < total,
+        next_cursor=None,
     )
 
 

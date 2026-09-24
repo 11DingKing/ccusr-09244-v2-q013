@@ -1,6 +1,14 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Any, Dict, List
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def normalize_utc_naive(value: Optional[datetime]) -> Optional[datetime]:
+    """业务时间统一成 naive UTC 落库：SQLite 不保留时区，键集分页按 UTC
+    墙钟文本比较，若混用带时区写入会让同一时刻以不同墙钟字符串排序。"""
+    if value is not None and value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 class OperationDataBase(BaseModel):
@@ -19,6 +27,11 @@ class OperationDataBase(BaseModel):
 
     environment_conditions: Optional[Dict[str, Any]] = Field(None, description="环境条件")
     hardware_status: Optional[Dict[str, Any]] = Field(None, description="硬件状态")
+
+    @field_validator("timestamp_start", "timestamp_end")
+    @classmethod
+    def _normalize_business_time(cls, value: datetime) -> datetime:
+        return normalize_utc_naive(value)
 
 
 class OperationDataCreate(OperationDataBase):
@@ -41,6 +54,11 @@ class OperationDataUpdate(BaseModel):
     quality_score: Optional[float] = None
     completeness_score: Optional[float] = None
     data_grade: Optional[str] = Field(None, max_length=10)
+
+    @field_validator("timestamp_start", "timestamp_end")
+    @classmethod
+    def _normalize_business_time(cls, value: Optional[datetime]) -> Optional[datetime]:
+        return normalize_utc_naive(value)
 
 
 class OperationDataResponse(BaseModel):
@@ -67,10 +85,16 @@ class OperationDataResponse(BaseModel):
 
 
 class OperationDataListResponse(BaseModel):
-    total: int
+    total: int = Field(..., description="符合筛选条件的记录总数")
     items: List[OperationDataResponse]
-    page: int
-    page_size: int
+    page: Optional[int] = Field(None, description="页码（仅页码分页模式返回）")
+    page_size: int = Field(..., description="本页大小")
+    mode: str = Field("offset", description="分页模式：offset(页码) 或 cursor(游标)")
+    order: str = Field("desc", description="排序方向：desc(业务开始时间从新到旧) 或 asc(从旧到新)")
+    has_next: bool = Field(..., description="是否还有下一页")
+    next_cursor: Optional[str] = Field(
+        None, description="下一页游标；has_next 为 false 时为 None，可持久化用于断点恢复"
+    )
 
 
 class BatchOperationResultItem(BaseModel):
