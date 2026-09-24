@@ -1,6 +1,6 @@
-from pydantic import BaseModel, Field
-from typing import Optional, Any, Dict, List
-from datetime import datetime
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, Any, Dict, List, Literal
+from datetime import datetime, timezone
 
 
 class OperationDataBase(BaseModel):
@@ -19,6 +19,15 @@ class OperationDataBase(BaseModel):
 
     environment_conditions: Optional[Dict[str, Any]] = Field(None, description="环境条件")
     hardware_status: Optional[Dict[str, Any]] = Field(None, description="硬件状态")
+
+    @field_validator("timestamp_start", "timestamp_end")
+    @classmethod
+    def _normalize_to_naive_utc(cls, value: datetime) -> datetime:
+        # SQLite 以 ISO 字符串保存时间，游标按键集字符串比较。统一存成朴素 UTC，
+        # 避免同一时刻因带不带时区、时区偏移写法不同而产生不同的字符串表示。
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
 
 
 class OperationDataCreate(OperationDataBase):
@@ -71,6 +80,11 @@ class OperationDataListResponse(BaseModel):
     items: List[OperationDataResponse]
     page: int
     page_size: int
+    # 游标模式相关字段；旧页码模式下保持为默认值，兼容既有客户端。
+    mode: Literal["page", "cursor"] = "page"
+    sort_order: Optional[Literal["asc", "desc"]] = None
+    has_next: Optional[bool] = None
+    next_cursor: Optional[str] = Field(None, description="下一页游标；has_next 为 false 时为 null")
 
 
 class BatchOperationResultItem(BaseModel):
